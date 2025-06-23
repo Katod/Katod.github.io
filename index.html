@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ivan Bozhenko - Unreal Engine Developer & GIF Gallery</title>
+    <style>
+        /* Basic Dark Theme Styling */
+        body {
+            font-family: 'Inter', sans-serif;
+            /* Using Inter font as per guidelines */
+            margin: 0;
+            padding: 20px;
+            background-color: #1a1a1a;
+            /* Dark background */
+            color: #f0f0f0;
+            /* Light text color */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+            box-sizing: border-box;
+            /* Include padding in element's total width and height */
+        }
+
+        /* Styling for the main header (Ivan Bozhenko) */
+        .main-header {
+            text-align: center;
+            margin-bottom: 40px;
+            padding: 20px;
+            background-color: #2a2a2a;
+            border-radius: 15px;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.6);
+            width: 90%;
+            max-width: 800px;
+        }
+
+        .main-header h1 {
+            color: #00bfff;
+            /* Bright blue for the name */
+            margin-bottom: 10px;
+            font-size: 3em;
+            /* Larger font size for the main name */
+            border-bottom: none;
+            /* Remove border from this h1 */
+            padding-bottom: 0;
+        }
+
+        .main-header p {
+            font-size: 1.5em;
+            /* Larger font size for the title */
+            color: #cccccc;
+            margin-top: 0;
+        }
+
+        /* Styling for the GIF Gallery title */
+        .gallery-title {
+            color: #00bfff;
+            /* Bright blue for the title */
+            margin-bottom: 30px;
+            text-align: center;
+            font-size: 2.5em;
+            border-bottom: 2px solid #00bfff;
+            padding-bottom: 10px;
+            width: 90%;
+            max-width: 800px;
+        }
+
+        /* GIF Grid Container */
+        .gif-grid-container {
+            display: grid;
+            /* Responsive grid: auto-fit creates as many columns as possible,
+               minmax ensures each column is at least 250px wide but can grow up to 1fr */
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            /* Space between grid items */
+            width: 90%;
+            /* Take up 90% of the viewport width */
+            max-width: 1200px;
+            /* Maximum width for the grid */
+            padding: 20px;
+            background-color: #2a2a2a;
+            /* Slightly lighter dark background for the container */
+            border-radius: 15px;
+            /* Rounded corners for the container */
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.6);
+            /* Soft shadow */
+        }
+
+        /* Individual GIF Item Styling */
+        .gif-item {
+            background-color: #3a3a3a;
+            /* Darker background for each GIF box */
+            border-radius: 10px;
+            /* Rounded corners for each GIF box */
+            overflow: hidden;
+            /* Ensures image corners match box corners */
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
+            /* Shadow for each GIF item */
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+            /* Smooth hover effect */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 10px;
+        }
+
+        .gif-item:hover {
+            transform: translateY(-5px) scale(1.02);
+            /* Lift and slightly enlarge on hover */
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.6);
+            /* Enhanced shadow on hover */
+        }
+
+        .gif-item img {
+            width: 100%;
+            /* Image fills its container */
+            height: auto;
+            /* Maintain aspect ratio */
+            display: block;
+            /* Remove extra space below image */
+            border-radius: 8px;
+            /* Slightly rounded corners for the image itself */
+            object-fit: cover;
+            /* Cover the area without stretching */
+        }
+
+        .gif-item p {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #cccccc;
+            text-align: center;
+            padding: 0 5px;
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .main-header h1 {
+                font-size: 2.5em;
+            }
+
+            .main-header p {
+                font-size: 1.2em;
+            }
+
+            .gallery-title {
+                font-size: 2em;
+            }
+
+            .gif-grid-container {
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                /* Smaller min width on smaller screens */
+                padding: 15px;
+                width: 95%;
+            }
+        }
+
+        @media (max-width: 480px) {
+            .main-header h1 {
+                font-size: 2em;
+            }
+
+            .main-header p {
+                font-size: 1em;
+            }
+
+            .gallery-title {
+                font-size: 1.8em;
+                margin-bottom: 20px;
+            }
+
+            .gif-grid-container {
+                grid-template-columns: 1fr;
+                /* Single column on very small screens */
+                padding: 10px;
+                width: 98%;
+            }
+
+            .gif-item {
+                padding: 8px;
+            }
+        }
+    </style>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="main-header">
+        <h1>Ivan Bozhenko</h1>
+        <p>Unreal Engine Developer</p>
+        <p>Welcome to my portfolio! Below you'll find a gallery of my work and projects.</p>
+        <p>
+            <a href="cv.html" target="_blank"
+                style="color:#fff;background:#00bfff;border-radius:6px;padding:8px 22px;font-size:1.1em;text-decoration:none;font-weight:bold;display:inline-block;transition:background 0.2s;">
+                <svg width="20" height="20" fill="currentColor" style="vertical-align:middle;margin-right:8px;"
+                    viewBox="0 0 24 24">
+                    <path
+                        d="M19 2H8c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V6l-5-4zm0 18H8V4h7v5h5v11zm-7-7h2v2h-2v-2zm0-4h2v2h-2V9z" />
+                </svg>
+                View CV
+            </a>
+        </p>
+    </div>
+
+    <h1 class="gallery-title">Work Examples</h1>
+
+    <div class="gif-grid-container">
+        <div class="gif-item">
+            <img src="images/PreviewJellyEffect.gif" alt="Jelly Effect" ...>
+            <p>Added jelly effect to the character movement animation and global position.</p>
+        </div>
+
+        <div class="gif-item">
+            <img src="images/PreviewVineNiagara.gif" alt="Vine Niagara"
+                onerror="this.onerror=null;this.src='https://placehold.co/300x200/FF0000/FFFFFF?text=Error';"
+                loading="lazy">
+            <p>Niagra VFX spline bind and create movement effect .</p>
+        </div>
+
+        <div class="gif-item">
+            <img src="images/PreviewFaceOSC.gif" alt="PreviewFaceOSC"
+                onerror="this.onerror=null;this.src='https://placehold.co/300x200/FF0000/FFFFFF?text=Error';"
+                loading="lazy">
+            <p>Plugin to send OSC messages to Unreal Engine.</p>
+        </div>
+
+        <div class="gif-item">
+            <img src="images/PreviewCavrnusRT.gif" alt="PreviewCavrnusRT"
+                onerror="this.onerror=null;this.src='https://placehold.co/300x200/FF0000/FFFFFF?text=Error';"
+                loading="lazy">
+            <p>Work on Cavrnus metaverse integration in Unreal Engine.</p>
+        </div>
+    </div>
+    <div style="width:100%;display:flex;justify-content:center;margin-top:40px;">
+        <div style="display:flex;gap:24px;">
+
+            <a href="https://www.linkedin.com/in/ivan-bozhenko-05a191a3/" target="_blank" title="LinkedIn"
+                style="color:#00bfff;text-decoration:none;font-size:2em;">
+                <svg width="32" height="32" fill="currentColor" viewBox="0 0 24 24">
+                    <path
+                        d="M19 0h-14c-2.761 0-5 2.239-5 5v14c0 2.761 2.239 5 5 5h14c2.761 0 5-2.239 5-5v-14c0-2.761-2.239-5-5-5zm-11 19h-3v-10h3v10zm-1.5-11.268c-.966 0-1.75-.784-1.75-1.75s.784-1.75 1.75-1.75 1.75.784 1.75 1.75-.784 1.75-1.75 1.75zm13.5 11.268h-3v-5.604c0-1.337-.025-3.063-1.868-3.063-1.868 0-2.154 1.459-2.154 2.967v5.7h-3v-10h2.881v1.367h.041c.401-.761 1.381-1.563 2.845-1.563 3.042 0 3.604 2.003 3.604 4.605v5.591z" />
+                </svg>
+            </a>
+            <a href="https://github.com/Katod" target="_blank" title="GitHub"
+                style="color:#00bfff;text-decoration:none;font-size:2em;">
+                <svg width="32" height="32" fill="currentColor" viewBox="0 0 24 24">
+                    <path
+                        d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.416-4.042-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.084-.729.084-.729 1.205.084 1.84 1.236 1.84 1.236 1.07 1.834 2.809 1.304 3.495.997.108-.775.418-1.305.762-1.605-2.665-.305-5.466-1.334-5.466-5.931 0-1.31.469-2.381 1.236-3.221-.124-.303-.535-1.523.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.553 3.297-1.23 3.297-1.23.653 1.653.242 2.873.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.803 5.624-5.475 5.921.43.372.823 1.102.823 2.222 0 1.606-.014 2.898-.014 3.293 0 .322.218.694.825.576C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12" />
+                </svg>
+            </a>
+            <a href="https://www.youtube.com/channel/UCgRqSNKqvLQwxhu1nVjoncw" target="_blank" title="YouTube"
+                style="color:#00bfff;text-decoration:none;font-size:2em;">
+                <svg width="32" height="32" fill="currentColor" viewBox="0 0 24 24">
+                    <path
+                        d="M23.498 6.186a2.994 2.994 0 0 0-2.112-2.112C19.454 3.5 12 3.5 12 3.5s-7.454 0-9.386.574A2.994 2.994 0 0 0 .502 6.186C0 8.12 0 12 0 12s0 3.88.502 5.814a2.994 2.994 0 0 0 2.112 2.112C4.546 20.5 12 20.5 12 20.5s7.454 0 9.386-.574a2.994 2.994 0 0 0 2.112-2.112C24 15.88 24 12 24 12s0-3.88-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+                </svg>
+            </a>
+            <a href="https://x.com/IvanBozhenko" target="_blank" title="Twitter"
+                style="color:#00bfff;text-decoration:none;font-size:2em;">
+                <!-- Twitter SVG -->
+                <svg width="32" height="32" fill="currentColor" viewBox="0 0 24 24">
+                    <path
+                        d="M24 4.557a9.83 9.83 0 0 1-2.828.775 4.932 4.932 0 0 0 2.165-2.724c-.951.564-2.005.974-3.127 1.195a4.916 4.916 0 0 0-8.38 4.482C7.691 8.095 4.066 6.13 1.64 3.161c-.542.929-.856 2.01-.857 3.17 0 2.188 1.115 4.117 2.823 5.254a4.904 4.904 0 0 1-2.229-.616c-.054 2.281 1.581 4.415 3.949 4.89a4.936 4.936 0 0 1-2.224.084c.627 1.956 2.444 3.377 4.6 3.417A9.867 9.867 0 0 1 0 21.543a13.94 13.94 0 0 0 7.548 2.209c9.058 0 14.009-7.513 14.009-14.009 0-.213-.005-.425-.014-.636A10.012 10.012 0 0 0 24 4.557z" />
+                </svg>
+            </a>
+        </div>
+    </div>
+</body>
+
+</html>
