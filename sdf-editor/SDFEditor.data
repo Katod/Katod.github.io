@@ -33,6 +33,9 @@ struct RenderParams {
     selectedObject: i32,
     shadowMode: i32,       // 0=None, 1=Hard, 2=Soft
     shadowSoftness: f32,   // Soft shadow k/w parameter
+    aaSamples: i32,
+    frameIndex: i32,
+    pixelSkip: i32,
     padding0: f32,
     padding1: f32,
 }
@@ -708,8 +711,7 @@ fn renderGrid(p: vec3f, ro: vec3f) -> vec4f {
     return vec4f(gridCol, lineAlpha);
 }
 
-@fragment
-fn fs_main(@location(0) uv: vec2f) -> FragmentOutput {
+fn renderAtUv(uv: vec2f) -> FragmentOutput {
     var output: FragmentOutput;
 
     // Convert UV from 0..1 to -1..1
@@ -899,5 +901,50 @@ fn fs_main(@location(0) uv: vec2f) -> FragmentOutput {
     let encodedId = f32(firstObjectId + 1) / 255.0;
     output.objectId = vec4f(encodedId, 0.0, 0.0, 1.0);
 
+    return output;
+}
+
+@fragment
+fn fs_main(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> FragmentOutput {
+    let skip = max(params.pixelSkip, 1);
+    if (skip > 1) {
+        let px = i32(fragPos.x);
+        let py = i32(fragPos.y);
+        let phase = (px + py) % skip;
+        let framePhase = params.frameIndex % skip;
+        if (phase != framePhase) {
+            discard;
+        }
+    }
+
+    let center = renderAtUv(uv);
+    let sampleCount = max(params.aaSamples, 1);
+    if (sampleCount <= 1) {
+        return center;
+    }
+
+    let gridDim = i32(ceil(sqrt(f32(sampleCount))));
+    var accum = vec3f(0.0);
+    var taken = 0;
+
+    for (var y = 0; y < gridDim; y++) {
+        for (var x = 0; x < gridDim; x++) {
+            if (taken >= sampleCount) {
+                break;
+            }
+
+            let jitter = (vec2f(f32(x) + 0.5, f32(y) + 0.5) / f32(gridDim)) - vec2f(0.5, 0.5);
+            let offsetUv = vec2f(jitter.x / params.resolutionX, jitter.y / params.resolutionY);
+            let sampleUv = clamp(uv + offsetUv, vec2f(0.0, 0.0), vec2f(1.0, 1.0));
+            let s = renderAtUv(sampleUv);
+            accum += s.color.rgb;
+            taken++;
+        }
+    }
+
+    var output = center;
+    output.color = vec4f(accum / f32(sampleCount), 1.0);
+    // Keep object-id from center sample for stable picking.
+    output.objectId = center.objectId;
     return output;
 }
