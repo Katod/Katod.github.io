@@ -1,0 +1,903 @@
+# Assets Directory
+
+This directory contains runtime assets for the SDF Editor.
+
+## Structure
+
+- `shaders/` - WGSL shader files (if using external shaders)
+- `textures/` - Texture resources
+- `fonts/` - Font files for ImGui (optional)
+
+## Notes
+
+Currently, all shaders are embedded in the source code (SDFRenderer.cpp) for simplicity and cross-platform compatibility. This makes it easier to build for both native and web targets without worrying about file path resolution.
+
+If you want to use external shader files instead, you can:
+1. Place .wgsl files in the shaders/ directory
+2. Modify the code to load them at runtime
+3. Update the CMakeLists.txt to copy them to the build directory
+struct CameraUniforms {
+    lookAt: vec3f,      // Look-at target position
+    distance: f32,
+    rotation: vec2f,    // Horizontal and vertical rotation
+}
+
+struct RenderParams {
+    maxIterations: i32,
+    epsilon: f32,
+    time: f32,
+    primitiveCount: i32,
+    viewportMode: i32,  // 0=Editor, 1=Render, 2=ObjectId
+    resolutionX: f32,
+    resolutionY: f32,
+    selectedObject: i32,
+    shadowMode: i32,       // 0=None, 1=Hard, 2=Soft
+    shadowSoftness: f32,   // Soft shadow k/w parameter
+    padding0: f32,
+    padding1: f32,
+}
+
+// GPU-aligned struct using vec4f for proper alignment (80 bytes per object)
+struct SDFObject {
+    positionAndType: vec4f,  // xyz = position, w = type (0=Sphere, 1=Box, 2=Torus, etc.)
+    scaleAndBlend: vec4f,    // xyz = scale/params, w = blendMode
+    rotationAndRadius: vec4f, // xyz = rotation (Euler angles), w = blendRadius
+    colorAndParent: vec4f,   // xyz = color, w = parentIndex (-1 = root)
+    extraParams: vec4f,      // x = params[3] (e.g. RoundBox rounding), y = uniform scale, zw = reserved
+}
+
+struct SDFModifier {
+    typeAndParams: vec4f,  // x=type, y/z/w=params
+}
+
+struct SDFMaterial {
+    baseColorOpacity: vec4f,        // rgb = baseColor, a = opacity
+    metalRoughAoAlphaMode: vec4f,   // x=metallic, y=roughness, z=ao, w=alphaMode
+    emissiveCutoff: vec4f,          // rgb=emissive, a=alphaCutoff
+}
+
+@group(0) @binding(0) var<uniform> camera: CameraUniforms;
+@group(0) @binding(1) var<uniform> params: RenderParams;
+@group(0) @binding(2) var<storage, read> objects: array<SDFObject>;
+@group(0) @binding(3) var<storage, read> modifiers: array<SDFModifier>;
+@group(0) @binding(4) var<storage, read> materials: array<SDFMaterial>;
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) uv: vec2f,
+}
+
+struct FragmentOutput {
+    @location(0) color: vec4f,
+    @location(1) objectId: vec4f,
+}
+
+@vertex
+fn vs_main(@location(0) position: vec2f) -> VertexOutput {
+    var output: VertexOutput;
+    output.position = vec4f(position, 0.0, 1.0);
+    output.uv = position * 0.5 + 0.5;
+    return output;
+}
+
+// SDF Primitives
+fn sdSphere(p: vec3f, r: f32) -> f32 {
+    return length(p) - r;
+}
+
+fn sdBox(p: vec3f, b: vec3f) -> f32 {
+    let q = abs(p) - b;
+    return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+fn sdTorus(p: vec3f, R: f32, r: f32) -> f32 {
+    let q = vec2f(length(p.xz) - R, p.y);
+    return length(q) - r;
+}
+
+fn sdCapsule(p: vec3f, r: f32, h: f32) -> f32 {
+    var q = p;
+    let py = p.y - clamp(p.y, -h * 0.5, h * 0.5);
+    return length(vec3f(p.x, py, p.z)) - r;
+}
+
+fn sdRoundBox(p: vec3f, b: vec3f, r: f32) -> f32 {
+    let q = abs(p) - b + r;
+    return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - r;
+}
+
+fn sdEllipsoid(p: vec3f, r: vec3f) -> f32 {
+    let k0 = length(p / r);
+    let k1 = length(p / (r * r));
+    return k0 * (k0 - 1.0) / k1;
+}
+
+fn sdOctahedron(p: vec3f, s: f32) -> f32 {
+    let q = abs(p);
+    let m = q.x + q.y + q.z - s;
+    var r: vec3f;
+    if (3.0 * q.x < m) { r = q; }
+    else if (3.0 * q.y < m) { r = vec3f(q.y, q.z, q.x); }
+    else if (3.0 * q.z < m) { r = vec3f(q.z, q.x, q.y); }
+    else { return m * 0.57735027; }
+    let k = clamp(0.5 * (r.z - r.y + s), 0.0, s);
+    return length(vec3f(r.x, r.y - s + k, r.z - k));
+}
+
+fn sdPyramid(p_in: vec3f, h: f32) -> f32 {
+    let m2 = h * h + 0.25;
+    var px = abs(p_in.x);
+    let py = p_in.y;
+    var pz = abs(p_in.z);
+    if (pz > px) {
+        let tmp = px;
+        px = pz;
+        pz = tmp;
+    }
+    px -= 0.5;
+    pz -= 0.5;
+    let qx = pz;
+    let qy = h * py - 0.5 * px;
+    let qz = h * px + 0.5 * py;
+    let s = max(-qx, 0.0);
+    let t = clamp((qy - 0.5 * pz) / (m2 + 0.25), 0.0, 1.0);
+    let a = m2 * (qx + s) * (qx + s) + qy * qy;
+    let b = m2 * (qx + 0.5 * t) * (qx + 0.5 * t) + (qy - m2 * t) * (qy - m2 * t);
+    var d2: f32;
+    if (min(qy, -qx * m2 - qy * 0.5) > 0.0) {
+        d2 = 0.0;
+    } else {
+        d2 = min(a, b);
+    }
+    return sqrt((d2 + qz * qz) / m2) * sign(max(qz, -py));
+}
+
+fn sdTriPrism(p: vec3f, h: vec2f) -> f32 {
+    let q = abs(p);
+    return max(q.z - h.y, max(q.x * 0.866025 + p.y * 0.5, -p.y) - h.x * 0.5);
+}
+
+fn sdPlane(p: vec3f, n: vec3f) -> f32 {
+    return dot(p, normalize(n));
+}
+
+fn sdInfCylinder(p: vec3f, r: f32) -> f32 {
+    return length(p.xz) - r;
+}
+
+// Boolean operations
+fn opUnion(d1: f32, d2: f32) -> f32 {
+    return min(d1, d2);
+}
+
+fn opSubtract(d1: f32, d2: f32) -> f32 {
+    return max(d1, -d2);
+}
+
+fn opIntersect(d1: f32, d2: f32) -> f32 {
+    return max(d1, d2);
+}
+
+// Smooth operations with blend factor k (IQ's improved formulas)
+fn opSmoothUnion(a: f32, b: f32, k: f32) -> f32 {
+    let k4 = k * 4.0;
+    let h = max(k4 - abs(a - b), 0.0);
+    return min(a, b) - h * h * 0.25 / k4;
+}
+
+fn opSmoothSubtract(a: f32, b: f32, k: f32) -> f32 {
+    return -opSmoothUnion(a, -b, k);
+}
+
+fn opSmoothIntersect(a: f32, b: f32, k: f32) -> f32 {
+    return -opSmoothUnion(-a, -b, k);
+}
+
+// Rotate point by Euler angles (XYZ order): builds Rz * Ry * Rx and applies to p
+fn rotatePoint(p: vec3f, r: vec3f) -> vec3f {
+    let cx = cos(r.x); let sx = sin(r.x);
+    let cy = cos(r.y); let sy = sin(r.y);
+    let cz = cos(r.z); let sz = sin(r.z);
+
+    // Rz * Ry * Rx
+    let m00 = cy * cz;
+    let m01 = cz * sx * sy - cx * sz;
+    let m02 = sx * sz + cx * cz * sy;
+    let m10 = cy * sz;
+    let m11 = cx * cz + sx * sy * sz;
+    let m12 = cx * sy * sz - cz * sx;
+    let m20 = -sy;
+    let m21 = cy * sx;
+    let m22 = cx * cy;
+
+    return vec3f(
+        m00 * p.x + m01 * p.y + m02 * p.z,
+        m10 * p.x + m11 * p.y + m12 * p.z,
+        m20 * p.x + m21 * p.y + m22 * p.z
+    );
+}
+
+// Domain modifiers
+fn opTwist(p: vec3f, k: f32) -> vec3f {
+    let c = cos(k * p.y);
+    let s = sin(k * p.y);
+    let q = vec2f(c * p.x - s * p.z, s * p.x + c * p.z);
+    return vec3f(q.x, p.y, q.y);
+}
+
+fn opBend(p: vec3f, k: f32) -> vec3f {
+    let c = cos(k * p.x);
+    let s = sin(k * p.x);
+    let q = vec2f(c * p.x - s * p.y, s * p.x + c * p.y);
+    return vec3f(q.x, q.y, p.z);
+}
+
+fn opDisplacement(p: vec3f, freq: f32, amp: f32) -> f32 {
+    return sin(freq * p.x) * sin(freq * p.y) * sin(freq * p.z) * amp;
+}
+
+fn opElongate(p: vec3f, h: vec3f) -> vec3f {
+    return p - clamp(p, -h, h);
+}
+
+// Get primitive distance
+fn getPrimitiveDist(p: vec3f, obj: SDFObject) -> f32 {
+    let position = obj.positionAndType.xyz;
+    let typeId = i32(obj.positionAndType.w);
+    let shapeParams = obj.scaleAndBlend.xyz;
+    let rotation = obj.rotationAndRadius.xyz;
+    let uniformScale = obj.extraParams.y;
+
+    // Transform: translate, rotate, then scale
+    var p_local = rotatePoint(p - position, rotation) / uniformScale;
+
+    // Apply domain modifiers (Twist, Bend, Elongate) and collect post-SDF modifiers
+    let modStart = i32(obj.extraParams.z);
+    let modCount = i32(obj.extraParams.w);
+    var displacementVal = 0.0;
+    var roundingVal = 0.0;
+    var onionCount = 0;
+    var onionThickness: array<f32, 4>;  // support up to 4 stacked onions
+    for (var m = modStart; m < modStart + modCount; m++) {
+        let mdf = modifiers[m];
+        let modType = i32(mdf.typeAndParams.x);
+        if (modType == 0) { // Twist
+            p_local = opTwist(p_local, mdf.typeAndParams.y);
+        } else if (modType == 1) { // Bend
+            p_local = opBend(p_local, mdf.typeAndParams.y);
+        } else if (modType == 2) { // Displacement
+            displacementVal += opDisplacement(p_local, mdf.typeAndParams.y, mdf.typeAndParams.z);
+        } else if (modType == 3) { // Elongation
+            p_local = opElongate(p_local, vec3f(mdf.typeAndParams.y, mdf.typeAndParams.z, mdf.typeAndParams.w));
+        } else if (modType == 4) { // Rounding
+            roundingVal += mdf.typeAndParams.y;
+        } else if (modType == 5) { // Onion
+            if (onionCount < 4) {
+                onionThickness[onionCount] = mdf.typeAndParams.y;
+                onionCount++;
+            }
+        }
+    }
+
+    var dist = 0.0;
+    if (typeId == 0) { // Sphere
+        dist = sdSphere(p_local, shapeParams.x);
+    } else if (typeId == 1) { // Box
+        dist = sdBox(p_local, shapeParams);
+    } else if (typeId == 2) { // Torus
+        dist = sdTorus(p_local, shapeParams.x, shapeParams.y);
+    } else if (typeId == 3) { // Cylinder
+        let q = vec2f(length(p_local.xz) - shapeParams.x, abs(p_local.y) - shapeParams.y * 0.5);
+        dist = min(max(q.x, q.y), 0.0) + length(max(q, vec2f(0.0)));
+    } else if (typeId == 4) { // Cone
+        let h = shapeParams.y;
+        let r = shapeParams.x;
+        // IQ exact cone SDF, centered to match the rest of our primitives:
+        // apex at +h/2, base center at -h/2.
+        let w = vec2f(length(p_local.xz), p_local.y - h * 0.5);
+        let q = vec2f(r, -h);
+        let a = w - q * clamp(dot(w, q) / dot(q, q), 0.0, 1.0);
+        let b = w - q * vec2f(clamp(w.x / q.x, 0.0, 1.0), 1.0);
+        let k = sign(q.y);
+        let d = min(dot(a, a), dot(b, b));
+        let s = max(k * (w.x * q.y - w.y * q.x), k * (w.y - q.y));
+        dist = sqrt(d) * sign(s);
+    } else if (typeId == 5) { // Capsule
+        dist = sdCapsule(p_local, shapeParams.x, shapeParams.y);
+    } else if (typeId == 6) { // Round Box
+        let rounding = obj.extraParams.x;  // params[3] from extraParams
+        dist = sdRoundBox(p_local, shapeParams, rounding);
+    } else if (typeId == 7) { // Ellipsoid
+        dist = sdEllipsoid(p_local, shapeParams);
+    } else if (typeId == 8) { // Octahedron
+        dist = sdOctahedron(p_local, shapeParams.x);
+    } else if (typeId == 9) { // Pyramid
+        dist = sdPyramid(p_local, shapeParams.x);
+    } else if (typeId == 10) { // Tri Prism
+        dist = sdTriPrism(p_local, vec2f(shapeParams.x, shapeParams.y));
+    } else if (typeId == 11) { // Plane
+        dist = sdPlane(p_local, shapeParams);
+    } else if (typeId == 12) { // Inf Cylinder
+        dist = sdInfCylinder(p_local, shapeParams.x);
+    } else {
+        dist = sdSphere(p_local, 0.5);
+    }
+    // Apply post-SDF modifiers
+    dist += displacementVal;
+    dist -= roundingVal;
+    for (var oi = 0; oi < onionCount; oi++) {
+        dist = abs(dist) - onionThickness[oi];
+    }
+    // Uniform scale: multiply distance by scale factor to preserve SDF correctness
+    return dist * uniformScale;
+}
+
+// Apply blend operation
+fn applyBlend(d1: f32, d2: f32, blendMode: i32, blendRadius: f32) -> f32 {
+    switch (blendMode) {
+        case 0: { return opUnion(d1, d2); }           // Union
+        case 1: { return opSubtract(d1, d2); }        // Subtract
+        case 2: { return opIntersect(d1, d2); }       // Intersect
+        case 3: { return opSmoothUnion(d1, d2, blendRadius); }    // Smooth Union
+        case 4: { return opSmoothSubtract(d1, d2, blendRadius); } // Smooth Subtract
+        case 5: { return opSmoothIntersect(d1, d2, blendRadius); } // Smooth Intersect
+        default: { return opUnion(d1, d2); }
+    }
+}
+
+// Evaluate a single group (root + children)
+// Objects are sorted so group members are contiguous
+fn evalGroup(p: vec3f, startIdx: i32, endIdx: i32) -> f32 {
+    if (startIdx >= endIdx) {
+        return 1000.0;
+    }
+
+    var d = getPrimitiveDist(p, objects[startIdx]);
+
+    for (var i = startIdx + 1; i < endIdx; i++) {
+        let obj = objects[i];
+        let parentIdx = i32(obj.colorAndParent.w);
+
+        // If this is a root (new group), stop
+        if (parentIdx < 0) {
+            break;
+        }
+
+        let blendMode = i32(obj.scaleAndBlend.w);
+        let blendRadius = obj.rotationAndRadius.w;
+        let dist = getPrimitiveDist(p, obj);
+
+        d = applyBlend(d, dist, blendMode, blendRadius);
+    }
+
+    return d;
+}
+
+// Scene map function - evaluates all groups and combines with union
+fn map(p: vec3f) -> f32 {
+    let count = params.primitiveCount;
+    if (count == 0) {
+        return 1000.0;
+    }
+
+    var result = 1000.0;
+    var groupStart = 0;
+
+    // Find and evaluate each group (contiguous primitives starting with a root)
+    for (var i = 0; i < count; i++) {
+        let obj = objects[i];
+        let parentIdx = i32(obj.colorAndParent.w);
+
+        // Root object starts a new group
+        if (parentIdx < 0) {
+            // If we had a previous group, it ended at i-1
+            if (i > groupStart) {
+                let groupDist = evalGroup(p, groupStart, i);
+                result = opUnion(result, groupDist);
+            }
+            groupStart = i;
+        }
+    }
+
+    // Evaluate the last group
+    let lastGroupDist = evalGroup(p, groupStart, count);
+    result = opUnion(result, lastGroupDist);
+
+    return result;
+}
+
+// Get color - finds closest surface and returns its color
+struct ColorAndId {
+    color: vec3f,
+    objectId: i32,
+}
+
+fn getColorAndId(p: vec3f) -> ColorAndId {
+    var result: ColorAndId;
+    result.color = vec3f(0.5, 0.5, 0.5);
+    result.objectId = -1;  // No object
+
+    let count = params.primitiveCount;
+    if (count == 0) {
+        return result;
+    }
+
+    var minDist = 1000.0;
+
+    // Find the closest primitive and use its color
+    for (var i = 0; i < count; i++) {
+        let obj = objects[i];
+        let dist = getPrimitiveDist(p, obj);
+        let objColor = obj.colorAndParent.xyz;
+        let blendMode = i32(obj.scaleAndBlend.w);
+
+        // For subtract operations, skip color contribution
+        if (blendMode == 1 || blendMode == 4) {
+            continue;
+        }
+
+        if (abs(dist) < abs(minDist)) {
+            minDist = dist;
+            result.color = objColor;
+            result.objectId = i;
+        }
+    }
+
+    return result;
+}
+
+
+fn shadePbr(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissive: vec3f,
+            n: vec3f, v: vec3f, l: vec3f, shadowFactor: f32) -> vec3f {
+    let nDotL = max(dot(n, l), 0.0);
+    let h = normalize(v + l);
+    let nDotH = max(dot(n, h), 0.0);
+    let hDotV = max(dot(h, v), 0.0);
+
+    let f0 = mix(vec3f(0.04), baseColor, metallic);
+    let fresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - hDotV, 5.0);
+
+    let specPower = mix(256.0, 8.0, roughness);
+    let spec = fresnel * pow(nDotH, specPower);
+
+    let kd = (vec3f(1.0) - fresnel) * (1.0 - metallic);
+    let diffuse = kd * baseColor;
+
+    let direct = (diffuse * nDotL + spec * nDotL) * shadowFactor;
+    let ambient = baseColor * 0.08 * ao;
+
+    return direct + ambient + emissive;
+}
+
+// Normal calculation
+fn normal(p: vec3f) -> vec3f {
+    let e = vec2f(0.0001, 0.0);
+    return normalize(vec3f(
+        map(p + e.xyy) - map(p - e.xyy),
+        map(p + e.yxy) - map(p - e.yxy),
+        map(p + e.yyx) - map(p - e.yyx)
+    ));
+}
+
+// [SHADOW_SECTION_BEGIN]
+// Hard shadow - raymarches from surface toward light
+fn hardShadow(ro: vec3f, rd: vec3f, mint: f32, maxt: f32) -> f32 {
+    var t = mint;
+    var transmittance = 1.0;
+    for (var i = 0; i < 128; i++) {
+        if (t >= maxt || transmittance < 0.01) { break; }
+        let p = ro + rd * t;
+        let h = map(p);
+        if (h < 0.001) {
+            let hitInfo = getColorAndId(p);
+            let oid = hitInfo.objectId;
+            if (oid < 0) { t += 0.01; continue; }
+
+            let mat = materials[oid];
+            let opacity = clamp(mat.baseColorOpacity.w, 0.0, 1.0);
+            let alphaMode = i32(mat.metalRoughAoAlphaMode.w);
+            let alphaCutoff = mat.emissiveCutoff.w;
+
+            if (alphaMode == 1 && opacity < alphaCutoff) {
+                // Cutout: skip past surface
+                t += 0.01;
+                for (var j = 0; j < 32; j++) {
+                    let dj = map(ro + rd * t);
+                    if (dj > 0.005) { break; }
+                    t += max(abs(dj), 0.005);
+                    if (t >= maxt) { break; }
+                }
+                continue;
+            }
+
+            if (alphaMode == 2 && opacity < 1.0) {
+                // Blend: attenuate once, skip past surface
+                transmittance *= (1.0 - opacity);
+                t += 0.01;
+                for (var j = 0; j < 32; j++) {
+                    let dj = map(ro + rd * t);
+                    if (dj > 0.005) { break; }
+                    t += max(abs(dj), 0.005);
+                    if (t >= maxt) { break; }
+                }
+                continue;
+            }
+
+            return 0.0;  // Opaque hit blocks all light
+        }
+        t += max(h, 0.001);
+    }
+    return transmittance;
+}
+
+// Improved soft shadow (Sebastian Aaltonen / iq)
+fn softShadow(ro: vec3f, rd: vec3f, mint: f32, maxt: f32, w: f32) -> f32 {
+    var res = 1.0;
+    var ph = 1e20;
+    var t = mint;
+    var transmittance = 1.0;
+    for (var i = 0; i < 128; i++) {
+        if (t >= maxt || transmittance < 0.01) { break; }
+        let p = ro + rd * t;
+        let h = map(p);
+        if (h < 0.001) {
+            let hitInfo = getColorAndId(p);
+            let oid = hitInfo.objectId;
+            if (oid < 0) { t += 0.01; ph = 1e20; continue; }
+
+            let mat = materials[oid];
+            let opacity = clamp(mat.baseColorOpacity.w, 0.0, 1.0);
+            let alphaMode = i32(mat.metalRoughAoAlphaMode.w);
+            let alphaCutoff = mat.emissiveCutoff.w;
+
+            if (alphaMode == 1 && opacity < alphaCutoff) {
+                t += 0.01;
+                for (var j = 0; j < 32; j++) {
+                    let dj = map(ro + rd * t);
+                    if (dj > 0.005) { break; }
+                    t += max(abs(dj), 0.005);
+                    if (t >= maxt) { break; }
+                }
+                ph = 1e20;
+                continue;
+            }
+
+            if (alphaMode == 2 && opacity < 1.0) {
+                transmittance *= (1.0 - opacity);
+                t += 0.01;
+                for (var j = 0; j < 32; j++) {
+                    let dj = map(ro + rd * t);
+                    if (dj > 0.005) { break; }
+                    t += max(abs(dj), 0.005);
+                    if (t >= maxt) { break; }
+                }
+                ph = 1e20;
+                continue;
+            }
+
+            return 0.0;
+        }
+        let y = h * h / (2.0 * ph);
+        let d = sqrt(h * h - y * y);
+        let penumbra = d / (w * max(0.0, t - y));
+        if (penumbra < res) {
+            // Check closest object's opacity to modulate penumbra
+            let nearInfo = getColorAndId(p);
+            var effectiveOpacity = 1.0;
+            if (nearInfo.objectId >= 0) {
+                let nearMat = materials[nearInfo.objectId];
+                let nearAlphaMode = i32(nearMat.metalRoughAoAlphaMode.w);
+                let nearOpacity = clamp(nearMat.baseColorOpacity.w, 0.0, 1.0);
+                let nearAlphaCutoff = nearMat.emissiveCutoff.w;
+                if (nearAlphaMode == 1 && nearOpacity < nearAlphaCutoff) {
+                    effectiveOpacity = 0.0;
+                } else if (nearAlphaMode == 2) {
+                    effectiveOpacity = nearOpacity;
+                }
+            }
+            res = min(res, mix(1.0, penumbra, effectiveOpacity));
+        }
+        ph = h;
+        t += max(h, 0.001);
+    }
+    return res * transmittance;
+}
+
+// Dispatch shadow based on mode
+fn calcShadow(p: vec3f, n: vec3f, l: vec3f) -> f32 {
+    if (params.shadowMode == 1) {
+        return hardShadow(p + n * 0.01, l, 0.01, 80.0);
+    } else if (params.shadowMode == 2) {
+        return softShadow(p + n * 0.01, l, 0.01, 80.0, params.shadowSoftness);
+    }
+    return 1.0;
+}
+// [SHADOW_SECTION_END]
+
+// Find the group root index for a given sorted object index
+fn findGroupRoot(objIdx: i32) -> i32 {
+    var idx = objIdx;
+    while (idx > 0) {
+        if (i32(objects[idx].colorAndParent.w) < 0) {
+            return idx;
+        }
+        idx--;
+    }
+    return 0;
+}
+
+// Scene map excluding up to 3 groups (pass -1 to not skip)
+fn mapExcluding(p: vec3f, skip0: i32, skip1: i32, skip2: i32) -> f32 {
+    let count = params.primitiveCount;
+    if (count == 0) { return 1000.0; }
+
+    var result = 1000.0;
+    var groupStart = 0;
+
+    for (var i = 0; i < count; i++) {
+        let parentIdx = i32(objects[i].colorAndParent.w);
+        if (parentIdx < 0) {
+            if (i > groupStart) {
+                if (groupStart != skip0 && groupStart != skip1 && groupStart != skip2) {
+                    result = opUnion(result, evalGroup(p, groupStart, i));
+                }
+            }
+            groupStart = i;
+        }
+    }
+
+    if (groupStart != skip0 && groupStart != skip1 && groupStart != skip2) {
+        result = opUnion(result, evalGroup(p, groupStart, count));
+    }
+
+    return result;
+}
+
+// Normal calculation excluding specific groups
+fn normalExcluding(p: vec3f, skip0: i32, skip1: i32, skip2: i32) -> vec3f {
+    let e = vec2f(0.0001, 0.0);
+    return normalize(vec3f(
+        mapExcluding(p + e.xyy, skip0, skip1, skip2) - mapExcluding(p - e.xyy, skip0, skip1, skip2),
+        mapExcluding(p + e.yxy, skip0, skip1, skip2) - mapExcluding(p - e.yxy, skip0, skip1, skip2),
+        mapExcluding(p + e.yyx, skip0, skip1, skip2) - mapExcluding(p - e.yyx, skip0, skip1, skip2)
+    ));
+}
+
+// Grid rendering function - returns vec4 with alpha for transparency
+fn renderGrid(p: vec3f, ro: vec3f) -> vec4f {
+    let gridSize = 1.0;  // 1 unit grid
+
+    // Distance-based line width for anti-aliasing
+    let dist = length(p - ro);
+    let lineWidth = 0.02 + dist * 0.002;
+
+    // Grid lines
+    let gx = abs(fract(p.x / gridSize + 0.5) - 0.5) * gridSize;
+    let gz = abs(fract(p.z / gridSize + 0.5) - 0.5) * gridSize;
+
+    // Distance from grid lines
+    let lineDist = min(gx, gz);
+
+    // Fade based on distance from camera
+    let fade = 1.0 - smoothstep(20.0, 50.0, dist);
+
+    // Base grid color
+    var gridCol = vec3f(0.4, 0.4, 0.45);
+
+    // Highlight axis lines (X = red, Z = blue)
+    let axisWidth = lineWidth * 3.0;
+    if (abs(p.z) < axisWidth) {
+        gridCol = vec3f(0.9, 0.2, 0.2);  // X-axis (red)
+    } else if (abs(p.x) < axisWidth) {
+        gridCol = vec3f(0.2, 0.2, 0.9);  // Z-axis (blue)
+    }
+
+    // Major grid lines (every 5 units) - brighter
+    let majorGx = abs(fract(p.x / 5.0 + 0.5) - 0.5) * 5.0;
+    let majorGz = abs(fract(p.z / 5.0 + 0.5) - 0.5) * 5.0;
+    let isMajor = min(majorGx, majorGz) < lineWidth * 2.0;
+
+    if (isMajor && abs(p.z) >= axisWidth && abs(p.x) >= axisWidth) {
+        gridCol = vec3f(0.6, 0.6, 0.65);
+    }
+
+    // Anti-aliased line using distance-based smoothing
+    let aa = lineWidth * 0.5;
+    let lineAlpha = (1.0 - smoothstep(lineWidth - aa, lineWidth + aa, lineDist)) * fade;
+
+    return vec4f(gridCol, lineAlpha);
+}
+
+@fragment
+fn fs_main(@location(0) uv: vec2f) -> FragmentOutput {
+    var output: FragmentOutput;
+
+    // Convert UV from 0..1 to -1..1
+    let screenCoord = uv * 2.0 - 1.0;
+
+    // Camera position: orbit around target
+    let camOffset = vec3f(
+        camera.distance * sin(camera.rotation.x) * cos(camera.rotation.y),
+        camera.distance * sin(camera.rotation.y),
+        camera.distance * cos(camera.rotation.x) * cos(camera.rotation.y)
+    );
+    let ro = camera.lookAt + camOffset;
+
+    // Calculate view direction with proper look-at
+    let forward = normalize(camera.lookAt - ro);
+    let worldUp = vec3f(0.0, 1.0, 0.0);
+    let right = normalize(cross(forward, worldUp));
+    let up = cross(right, forward);
+
+    // Ray direction through pixel (aspect-corrected)
+    let aspect = params.resolutionX / params.resolutionY;
+    let rd = normalize(forward * 2.0 + right * screenCoord.x * aspect + up * screenCoord.y);
+
+    // Check ray-plane intersection with y=0 plane
+    var gridT = 1000.0;
+    if (abs(rd.y) > 0.0001) {
+        gridT = -ro.y / rd.y;
+        if (gridT < 0.0) {
+            gridT = 1000.0;  // Plane is behind camera
+        }
+    }
+
+    // Background color
+    let bgCol = vec3f(0.1, 0.1, 0.15);
+    let l = normalize(vec3f(-0.4, 1.0, 0.5));
+
+    // Front-to-back transparency compositing
+    var accumulated = vec3f(0.0);
+    var remaining = 1.0;  // How much background still contributes
+    var firstObjectId: i32 = -1;
+    var firstHitT = 1000.0;
+    var firstHitNormal = vec3f(0.0);
+    var firstHitViewDir = vec3f(0.0);
+    var currentT = 0.0;
+    var anyHit = false;
+
+    // Groups to skip when raymarching through transparent objects (individual vars for WGSL compat)
+    var skip0: i32 = -1;
+    var skip1: i32 = -1;
+    var skip2: i32 = -1;
+    var numSkipped: i32 = 0;
+
+    for (var layer = 0; layer < 4; layer++) {
+        if (remaining < 0.01) { break; }
+        if (currentT > 80.0) { break; }
+
+        // Raymarch from currentT, using mapExcluding for layers after transparent hits
+        var t = currentT;
+        var hit = false;
+        for (var i = 0; i < 100; i++) {
+            let p = ro + rd * t;
+            var d: f32;
+            if (numSkipped > 0) {
+                d = mapExcluding(p, skip0, skip1, skip2);
+            } else {
+                d = map(p);
+            }
+            if (d < 0.001) {
+                hit = true;
+                break;
+            }
+            t += d;
+            if (t > 80.0) { break; }
+        }
+
+        if (!hit) { break; }
+
+        let p = ro + rd * t;
+        // Use excluding normal when we've skipped groups, so inner surface normals are correct
+        var n: vec3f;
+        if (numSkipped > 0) {
+            n = normalExcluding(p, skip0, skip1, skip2);
+        } else {
+            n = normal(p);
+        }
+        let v = normalize(ro - p);
+        let colorAndId = getColorAndId(p);
+        let objectId = colorAndId.objectId;
+
+        if (objectId < 0) { break; }
+
+        // ObjectId mode - just use first hit
+        if (params.viewportMode == 2) {
+            let idColor = vec3f(
+                f32((objectId * 67) % 255) / 255.0,
+                f32((objectId * 137) % 255) / 255.0,
+                f32((objectId * 223) % 255) / 255.0
+            );
+            accumulated = idColor;
+            remaining = 0.0;
+            firstObjectId = objectId;
+            anyHit = true;
+            break;
+        }
+
+        let mat = materials[objectId];
+        let baseColor = mat.baseColorOpacity.xyz;
+        let opacity = mat.baseColorOpacity.w;
+        let metallic = mat.metalRoughAoAlphaMode.x;
+        let roughness = max(0.02, mat.metalRoughAoAlphaMode.y);
+        let ao = mat.metalRoughAoAlphaMode.z;
+        let alphaMode = i32(mat.metalRoughAoAlphaMode.w);
+        let emissive = mat.emissiveCutoff.xyz;
+        let alphaCutoff = mat.emissiveCutoff.w;
+
+        // Cutout mode: discard surface and continue ray past this group
+        if (alphaMode == 1 && opacity < alphaCutoff) {
+            let root = findGroupRoot(objectId);
+            if (numSkipped == 0) { skip0 = root; }
+            else if (numSkipped == 1) { skip1 = root; }
+            else if (numSkipped == 2) { skip2 = root; }
+            numSkipped = min(numSkipped + 1, 3);
+            currentT = t + 0.005;
+            continue;
+        }
+
+        anyHit = true;
+
+        // Record first visible hit for selection highlight and picking
+        if (firstObjectId < 0) {
+            firstObjectId = objectId;
+            firstHitT = t;
+            firstHitNormal = n;
+            firstHitViewDir = v;
+        }
+
+        // Shade the surface
+        var shadowFactor = calcShadow(p, n, l);
+        let litColor = shadePbr(baseColor, metallic, roughness, ao, emissive, n, v, l, shadowFactor);
+
+        // Blend mode: partial opacity, continue ray behind
+        if (alphaMode == 2 && opacity < 1.0) {
+            accumulated += litColor * opacity * remaining;
+            remaining *= (1.0 - opacity);
+            // Add this group to skip list so we can find objects inside/behind it
+            let root = findGroupRoot(objectId);
+            if (numSkipped == 0) { skip0 = root; }
+            else if (numSkipped == 1) { skip1 = root; }
+            else if (numSkipped == 2) { skip2 = root; }
+            numSkipped = min(numSkipped + 1, 3);
+            currentT = t + 0.005;
+            continue;
+        }
+
+        // Opaque: fully absorb remaining light
+        accumulated += litColor * remaining;
+        remaining = 0.0;
+        break;
+    }
+
+    // Composite with background
+    var col = accumulated + bgCol * remaining;
+
+    // Highlight selected object with rim glow (on first visible hit)
+    if (firstObjectId == params.selectedObject && params.selectedObject >= 0 && anyHit) {
+        let rim = pow(1.0 - max(dot(firstHitNormal, firstHitViewDir), 0.0), 2.0);
+        col = col + vec3f(0.2, 0.4, 1.0) * rim * 0.5;
+        col = col * 1.1;
+    }
+
+    // Overlay grid lines (only in Editor mode = 0)
+    if (params.viewportMode == 0) {
+        let sdfDist = select(firstHitT, 1000.0, !anyHit);
+        if (gridT > 0.0 && gridT < 80.0) {
+            let gridPos = ro + rd * gridT;
+            let gridResult = renderGrid(gridPos, ro);
+
+            if (gridResult.a > 0.01) {
+                if (gridT < sdfDist) {
+                    col = mix(col, gridResult.rgb, gridResult.a);
+                }
+            }
+        }
+    }
+
+    output.color = vec4f(col, 1.0);
+    let encodedId = f32(firstObjectId + 1) / 255.0;
+    output.objectId = vec4f(encodedId, 0.0, 0.0, 1.0);
+
+    return output;
+}
