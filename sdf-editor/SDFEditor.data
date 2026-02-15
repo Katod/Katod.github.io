@@ -27,7 +27,7 @@ struct RenderParams {
     epsilon: f32,
     time: f32,
     primitiveCount: i32,
-    viewportMode: i32,  // 0=Editor, 1=Render, 2=ObjectId
+    viewportMode: i32,  // 0=Editor, 1=Render, 2=ObjectId, 3=BoundsDebug
     resolutionX: f32,
     resolutionY: f32,
     selectedObject: i32,
@@ -36,8 +36,13 @@ struct RenderParams {
     aaSamples: i32,
     frameIndex: i32,
     pixelSkip: i32,
+    groupCount: i32,
+    accelerationMode: i32,  // 0=Off, 1=Bounds, 2=BVH
+    bvhNodeCount: i32,
+    bvhRootIndex: i32,
     padding0: f32,
     padding1: f32,
+    padding2: f32,
 }
 
 // GPU-aligned struct using vec4f for proper alignment (80 bytes per object)
@@ -59,11 +64,23 @@ struct SDFMaterial {
     emissiveCutoff: vec4f,          // rgb=emissive, a=alphaCutoff
 }
 
+struct GroupBound {
+    centerRadius: vec4f,   // xyz=center, w=radius
+    startEndFlags: vec4f,  // x=startIdx, y=endIdx, z=groupId, w=flags
+}
+
+struct BVHNode {
+    minAndLeft: vec4f,   // xyz=min, w=left child (-1 for leaf)
+    maxAndRight: vec4f,  // xyz=max, w=right child or group index (leaf)
+}
+
 @group(0) @binding(0) var<uniform> camera: CameraUniforms;
 @group(0) @binding(1) var<uniform> params: RenderParams;
 @group(0) @binding(2) var<storage, read> objects: array<SDFObject>;
 @group(0) @binding(3) var<storage, read> modifiers: array<SDFModifier>;
 @group(0) @binding(4) var<storage, read> materials: array<SDFMaterial>;
+@group(0) @binding(5) var<storage, read> groupBounds: array<GroupBound>;
+@group(0) @binding(6) var<storage, read> bvhNodes: array<BVHNode>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -376,37 +393,156 @@ fn evalGroup(p: vec3f, startIdx: i32, endIdx: i32) -> f32 {
     return d;
 }
 
-// Scene map function - evaluates all groups and combines with union
-fn map(p: vec3f) -> f32 {
-    let count = params.primitiveCount;
-    if (count == 0) {
+fn evalGroupByBound(p: vec3f, gb: GroupBound) -> f32 {
+    return evalGroup(p, i32(gb.startEndFlags.x), i32(gb.startEndFlags.y));
+}
+
+fn shouldSkipGroup(groupId: i32, skip0: i32, skip1: i32, skip2: i32, useSkip: bool) -> bool {
+    if (!useSkip) {
+        return false;
+    }
+    return groupId == skip0 || groupId == skip1 || groupId == skip2;
+}
+
+fn sphereLowerBound(p: vec3f, center: vec3f, radius: f32) -> f32 {
+    return length(p - center) - radius;
+}
+
+fn aabbLowerBound(p: vec3f, bmin: vec3f, bmax: vec3f) -> f32 {
+    let c = (bmin + bmax) * 0.5;
+    let e = (bmax - bmin) * 0.5;
+    let d = abs(p - c) - e;
+    let outside = length(max(d, vec3f(0.0)));
+    let inside = min(max(d.x, max(d.y, d.z)), 0.0);
+    return outside + inside;
+}
+
+fn raySphereHit(ro: vec3f, rd: vec3f, center: vec3f, radius: f32) -> f32 {
+    let oc = ro - center;
+    let b = dot(oc, rd);
+    let c = dot(oc, oc) - radius * radius;
+    let h = b * b - c;
+    if (h < 0.0) {
+        return -1.0;
+    }
+
+    let s = sqrt(h);
+    var t = -b - s;
+    if (t < 0.0) {
+        t = -b + s;
+    }
+    return t;
+}
+
+fn mapInternal(p: vec3f, skip0: i32, skip1: i32, skip2: i32, useSkip: bool) -> f32 {
+    let gcount = params.groupCount;
+    if (gcount <= 0) {
         return 1000.0;
     }
 
     var result = 1000.0;
-    var groupStart = 0;
+    let mode = params.accelerationMode;
+    let useBounds = (mode != 0);
+    let tryBvh = (mode == 2) && (params.bvhNodeCount > 0) && (params.bvhRootIndex >= 0);
 
-    // Find and evaluate each group (contiguous primitives starting with a root)
-    for (var i = 0; i < count; i++) {
-        let obj = objects[i];
-        let parentIdx = i32(obj.colorAndParent.w);
+    if (tryBvh) {
+        var stack: array<i32, 256>;
+        var top: i32 = 0;
+        stack[0] = params.bvhRootIndex;
 
-        // Root object starts a new group
-        if (parentIdx < 0) {
-            // If we had a previous group, it ended at i-1
-            if (i > groupStart) {
-                let groupDist = evalGroup(p, groupStart, i);
-                result = opUnion(result, groupDist);
+        for (var iter = 0; iter < 512; iter++) {
+            if (top < 0) {
+                break;
             }
-            groupStart = i;
+
+            let nodeIndex = stack[top];
+            top -= 1;
+            if (nodeIndex < 0 || nodeIndex >= params.bvhNodeCount) {
+                continue;
+            }
+
+            let node = bvhNodes[nodeIndex];
+            let nodeLB = aabbLowerBound(p, node.minAndLeft.xyz, node.maxAndRight.xyz);
+            if (nodeLB >= result) {
+                continue;
+            }
+
+            let leftIndex = i32(node.minAndLeft.w);
+            if (leftIndex < 0) {
+                let groupIndex = i32(node.maxAndRight.w);
+                if (groupIndex < 0 || groupIndex >= gcount) {
+                    continue;
+                }
+                let gb = groupBounds[groupIndex];
+                let groupId = i32(gb.startEndFlags.z);
+                if (shouldSkipGroup(groupId, skip0, skip1, skip2, useSkip)) {
+                    continue;
+                }
+
+                let sphereLB = sphereLowerBound(p, gb.centerRadius.xyz, gb.centerRadius.w);
+                if (sphereLB >= result) {
+                    continue;
+                }
+
+                let groupDist = evalGroupByBound(p, gb);
+                result = opUnion(result, groupDist);
+                continue;
+            }
+
+            let rightIndex = i32(node.maxAndRight.w);
+            if (leftIndex >= 0 && leftIndex < params.bvhNodeCount && (top + 1) < 256) {
+                top += 1;
+                stack[top] = leftIndex;
+            }
+            if (rightIndex >= 0 && rightIndex < params.bvhNodeCount && (top + 1) < 256) {
+                top += 1;
+                stack[top] = rightIndex;
+            }
         }
+
+        // Always evaluate fallback/unbounded groups exactly.
+        for (var g = 0; g < gcount; g++) {
+            let gb = groupBounds[g];
+            let flags = i32(gb.startEndFlags.w);
+            if (flags == 0) {
+                continue;
+            }
+            let groupId = i32(gb.startEndFlags.z);
+            if (shouldSkipGroup(groupId, skip0, skip1, skip2, useSkip)) {
+                continue;
+            }
+            let groupDist = evalGroupByBound(p, gb);
+            result = opUnion(result, groupDist);
+        }
+        return result;
     }
 
-    // Evaluate the last group
-    let lastGroupDist = evalGroup(p, groupStart, count);
-    result = opUnion(result, lastGroupDist);
+    // Off/Bounds mode (and BVH fallback path).
+    for (var g = 0; g < gcount; g++) {
+        let gb = groupBounds[g];
+        let groupId = i32(gb.startEndFlags.z);
+        if (shouldSkipGroup(groupId, skip0, skip1, skip2, useSkip)) {
+            continue;
+        }
+
+        let flags = i32(gb.startEndFlags.w);
+        if (useBounds && flags == 0) {
+            let lowerBound = sphereLowerBound(p, gb.centerRadius.xyz, gb.centerRadius.w);
+            if (lowerBound >= result) {
+                continue;
+            }
+        }
+
+        let groupDist = evalGroupByBound(p, gb);
+        result = opUnion(result, groupDist);
+    }
 
     return result;
+}
+
+// Scene map function - evaluates groups and combines with union.
+fn map(p: vec3f) -> f32 {
+    return mapInternal(p, -1, -1, -1, false);
 }
 
 // Get color - finds closest surface and returns its color
@@ -631,29 +767,7 @@ fn findGroupRoot(objIdx: i32) -> i32 {
 
 // Scene map excluding up to 3 groups (pass -1 to not skip)
 fn mapExcluding(p: vec3f, skip0: i32, skip1: i32, skip2: i32) -> f32 {
-    let count = params.primitiveCount;
-    if (count == 0) { return 1000.0; }
-
-    var result = 1000.0;
-    var groupStart = 0;
-
-    for (var i = 0; i < count; i++) {
-        let parentIdx = i32(objects[i].colorAndParent.w);
-        if (parentIdx < 0) {
-            if (i > groupStart) {
-                if (groupStart != skip0 && groupStart != skip1 && groupStart != skip2) {
-                    result = opUnion(result, evalGroup(p, groupStart, i));
-                }
-            }
-            groupStart = i;
-        }
-    }
-
-    if (groupStart != skip0 && groupStart != skip1 && groupStart != skip2) {
-        result = opUnion(result, evalGroup(p, groupStart, count));
-    }
-
-    return result;
+    return mapInternal(p, skip0, skip1, skip2, true);
 }
 
 // Normal calculation excluding specific groups
@@ -747,6 +861,69 @@ fn renderAtUv(uv: vec2f) -> FragmentOutput {
     // Background color
     let bgCol = vec3f(0.1, 0.1, 0.15);
     let l = normalize(vec3f(-0.4, 1.0, 0.5));
+
+    // Bounds debug viewport: visualize group conservative sphere bounds.
+    if (params.viewportMode == 3) {
+        var nearestT = 1e20;
+        var hitGroup = -1;
+        var hitRoot = -1;
+        var hitFlags = 0;
+        var hitCenter = vec3f(0.0);
+        var hitRadius = 0.0;
+
+        for (var g = 0; g < params.groupCount; g++) {
+            let gb = groupBounds[g];
+            let flags = i32(gb.startEndFlags.w);
+
+            // Unbounded groups are intentionally skipped in this debug view.
+            if ((flags & 1) != 0) {
+                continue;
+            }
+
+            let center = gb.centerRadius.xyz;
+            let radius = gb.centerRadius.w;
+            if (radius <= 0.0) {
+                continue;
+            }
+
+            let t = raySphereHit(ro, rd, center, radius);
+            if (t > 0.0 && t < nearestT) {
+                nearestT = t;
+                hitGroup = g;
+                hitRoot = i32(gb.startEndFlags.z);
+                hitFlags = flags;
+                hitCenter = center;
+                hitRadius = radius;
+            }
+        }
+
+        var outDbg: FragmentOutput;
+        if (hitGroup < 0) {
+            outDbg.color = vec4f(bgCol, 1.0);
+            outDbg.objectId = vec4f(0.0, 0.0, 0.0, 1.0);
+            return outDbg;
+        }
+
+        let pHit = ro + rd * nearestT;
+        let nHit = normalize((pHit - hitCenter) / max(hitRadius, 1e-4));
+        let ndotl = max(dot(nHit, l), 0.0);
+        var base = vec3f(
+            f32((hitGroup * 67) % 255) / 255.0,
+            f32((hitGroup * 137) % 255) / 255.0,
+            f32((hitGroup * 223) % 255) / 255.0
+        );
+        base = base * 0.55 + vec3f(0.25);
+
+        if ((hitFlags & 2) != 0) {
+            base = mix(base, vec3f(1.0, 0.85, 0.2), 0.6);  // fallbackExact marked
+        }
+
+        let col = base * (0.25 + 0.75 * ndotl);
+        outDbg.color = vec4f(col, 1.0);
+        let encodedId = f32(hitRoot + 1) / 255.0;
+        outDbg.objectId = vec4f(encodedId, 0.0, 0.0, 1.0);
+        return outDbg;
+    }
 
     // Front-to-back transparency compositing
     var accumulated = vec3f(0.0);
