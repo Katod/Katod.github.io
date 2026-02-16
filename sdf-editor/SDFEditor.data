@@ -25,7 +25,7 @@ struct CameraUniforms {
 struct RenderParams {
     maxIterations: i32,
     epsilon: f32,
-    time: f32,
+    reflectionStrength: f32,
     primitiveCount: i32,
     viewportMode: i32,  // 0=Editor, 1=Render, 2=ObjectId, 3=BoundsDebug
     resolutionX: f32,
@@ -40,9 +40,9 @@ struct RenderParams {
     accelerationMode: i32,  // 0=Off, 1=Bounds, 2=BVH
     bvhNodeCount: i32,
     bvhRootIndex: i32,
-    padding0: f32,
-    padding1: f32,
-    padding2: f32,
+    reflectionMode: f32,         // 0.0=Sky only, 1.0=Trace scene + sky fallback
+    reflectionMaxSteps: f32,     // integer stored in float slot
+    reflectionMaxDistance: f32,
 }
 
 // GPU-aligned struct using vec4f for proper alignment (80 bytes per object)
@@ -81,6 +81,8 @@ struct BVHNode {
 @group(0) @binding(4) var<storage, read> materials: array<SDFMaterial>;
 @group(0) @binding(5) var<storage, read> groupBounds: array<GroupBound>;
 @group(0) @binding(6) var<storage, read> bvhNodes: array<BVHNode>;
+@group(0) @binding(7) var skySampler: sampler;
+@group(0) @binding(8) var skyTexture: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -585,16 +587,75 @@ fn getColorAndId(p: vec3f) -> ColorAndId {
     return result;
 }
 
+const PI: f32 = 3.14159265358979323846;
+const TWO_PI: f32 = 6.28318530717958647692;
+
+fn directionToSkyUv(dir: vec3f) -> vec2f {
+    let n = normalize(dir);
+    let phi = atan2(n.z, n.x);
+    let theta = acos(clamp(n.y, -1.0, 1.0));
+    let u = fract(phi / TWO_PI + 0.5);
+    let v = theta / PI;
+    return vec2f(u, v);
+}
+
+fn sampleSky(dir: vec3f) -> vec3f {
+    let uv = directionToSkyUv(dir);
+    // Explicit LOD avoids fragment-uniform-control-flow restrictions of textureSample().
+    return textureSampleLevel(skyTexture, skySampler, uv, 0.0).rgb;
+}
+
+fn traceSceneReflection(ro: vec3f, rd: vec3f, skipRoot: i32) -> vec3f {
+    let maxDist = max(params.reflectionMaxDistance, 1.0);
+    let maxSteps = max(i32(params.reflectionMaxSteps), 1);
+    var t = 0.02;
+
+    for (var i = 0; i < maxSteps; i++) {
+        if (t > maxDist) {
+            break;
+        }
+
+        let p = ro + rd * t;
+        let d = mapExcluding(p, skipRoot, -1, -1);
+        if (d < 0.001) {
+            let hit = getColorAndId(p);
+            if (hit.objectId < 0) {
+                t += 0.01;
+                continue;
+            }
+
+            let mat = materials[hit.objectId];
+            let opacity = clamp(mat.baseColorOpacity.w, 0.0, 1.0);
+            let alphaMode = i32(mat.metalRoughAoAlphaMode.w);
+            let alphaCutoff = mat.emissiveCutoff.w;
+
+            if (alphaMode == 1 && opacity < alphaCutoff) {
+                t += 0.02;
+                continue;
+            }
+
+            let alphaWeight = select(1.0, opacity, alphaMode == 2);
+            let hitColor = mat.baseColorOpacity.xyz * max(alphaWeight, 0.15) + mat.emissiveCutoff.xyz;
+            return hitColor;
+        }
+
+        t += max(d, 0.01);
+    }
+
+    return sampleSky(rd);
+}
 
 fn shadePbr(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissive: vec3f,
-            n: vec3f, v: vec3f, l: vec3f, shadowFactor: f32) -> vec3f {
+            n: vec3f, v: vec3f, l: vec3f, shadowFactor: f32, p: vec3f, hitGroupRoot: i32) -> vec3f {
     let nDotL = max(dot(n, l), 0.0);
     let h = normalize(v + l);
     let nDotH = max(dot(n, h), 0.0);
     let hDotV = max(dot(h, v), 0.0);
+    let nDotV = max(dot(n, v), 0.0);
 
     let f0 = mix(vec3f(0.04), baseColor, metallic);
     let fresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - hDotV, 5.0);
+    let viewFresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - nDotV, 5.0);
 
     let specPower = mix(256.0, 8.0, roughness);
     let spec = fresnel * pow(nDotH, specPower);
@@ -603,7 +664,16 @@ fn shadePbr(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissive: 
     let diffuse = kd * baseColor;
 
     let direct = (diffuse * nDotL + spec * nDotL) * shadowFactor;
-    let ambient = baseColor * 0.08 * ao;
+    let reflDir = normalize(mix(reflect(-v, n), n, roughness * roughness));
+    var envColor = sampleSky(reflDir);
+    if (params.reflectionMode > 0.5 && metallic > 0.001) {
+        envColor = traceSceneReflection(p + n * 0.02, reflDir, hitGroupRoot);
+    }
+    let envSpecStrength = mix(1.0, 0.35, roughness);
+    let reflStrength = clamp(params.reflectionStrength, 0.0, 1.0);
+    let envSpec = envColor * viewFresnel * envSpecStrength * reflStrength;
+    let ambientDiffuse = baseColor * (1.0 - metallic) * 0.08 * ao;
+    let ambient = ambientDiffuse + envSpec * ao;
 
     return direct + ambient + emissive;
 }
@@ -858,8 +928,8 @@ fn renderAtUv(uv: vec2f) -> FragmentOutput {
         }
     }
 
-    // Background color
-    let bgCol = vec3f(0.1, 0.1, 0.15);
+    // Background from sky texture.
+    let bgCol = sampleSky(rd);
     let l = normalize(vec3f(-0.4, 1.0, 0.5));
 
     // Bounds debug viewport: visualize group conservative sphere bounds.
@@ -1027,7 +1097,8 @@ fn renderAtUv(uv: vec2f) -> FragmentOutput {
 
         // Shade the surface
         var shadowFactor = calcShadow(p, n, l);
-        let litColor = shadePbr(baseColor, metallic, roughness, ao, emissive, n, v, l, shadowFactor);
+        let hitRoot = findGroupRoot(objectId);
+        let litColor = shadePbr(baseColor, metallic, roughness, ao, emissive, n, v, l, shadowFactor, p, hitRoot);
 
         // Blend mode: partial opacity, continue ray behind
         if (alphaMode == 2 && opacity < 1.0) {
