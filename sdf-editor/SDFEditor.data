@@ -118,7 +118,6 @@ fn sdTorus(p: vec3f, R: f32, r: f32) -> f32 {
 }
 
 fn sdCapsule(p: vec3f, r: f32, h: f32) -> f32 {
-    var q = p;
     let py = p.y - clamp(p.y, -h * 0.5, h * 0.5);
     return length(vec3f(p.x, py, p.z)) - r;
 }
@@ -180,7 +179,7 @@ fn sdTriPrism(p: vec3f, h: vec2f) -> f32 {
 }
 
 fn sdPlane(p: vec3f, n: vec3f) -> f32 {
-    return dot(p, normalize(n));
+    return dot(p, n);  // n is pre-normalized on CPU in SDFPrimitiveConsistency
 }
 
 fn sdInfCylinder(p: vec3f, r: f32) -> f32 {
@@ -551,6 +550,7 @@ fn map(p: vec3f) -> f32 {
 struct ColorAndId {
     color: vec3f,
     objectId: i32,
+    groupRoot: i32,  // sorted index of the group root (= startIdx = groupId)
 }
 
 // Group-aware surface attribution: finds the closest group via combined SDF
@@ -559,6 +559,7 @@ fn getColorAndId(p: vec3f) -> ColorAndId {
     var result: ColorAndId;
     result.color = vec3f(0.5, 0.5, 0.5);
     result.objectId = -1;
+    result.groupRoot = -1;
 
     let gcount = params.groupCount;
     if (gcount <= 0) {
@@ -585,6 +586,7 @@ fn getColorAndId(p: vec3f) -> ColorAndId {
     let gb = groupBounds[bestGroupIdx];
     let startIdx = i32(gb.startEndFlags.x);
     let endIdx = i32(gb.startEndFlags.y);
+    result.groupRoot = startIdx;  // groupId == startIdx (confirmed in SDFRenderer.cpp)
 
     var minDist = 1000.0;
     for (var i = startIdx; i < endIdx; i++) {
@@ -630,6 +632,14 @@ fn sampleSky(dir: vec3f) -> vec3f {
     return textureSampleLevel(skyTexture, skySampler, uv, 0.0).rgb;
 }
 
+// Faster variant for already-normalized directions — skips the normalize() in directionToSkyUv.
+fn sampleSkyNorm(dir: vec3f) -> vec3f {
+    let phi = atan2(dir.z, dir.x);
+    let theta = acos(clamp(dir.y, -1.0, 1.0));
+    let uv = vec2f(fract(phi / TWO_PI + 0.5), theta / PI);
+    return textureSampleLevel(skyTexture, skySampler, uv, 0.0).rgb;
+}
+
 fn shadePbrCore(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissive: vec3f,
                 n: vec3f, v: vec3f, l: vec3f, shadowFactor: f32,
                 envColor: vec3f, reflectionScale: f32) -> vec3f {
@@ -640,8 +650,11 @@ fn shadePbrCore(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissi
     let nDotV = max(dot(n, v), 0.0);
 
     let f0 = mix(vec3f(0.04), baseColor, metallic);
-    let fresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - hDotV, 5.0);
-    let viewFresnel = f0 + (vec3f(1.0) - f0) * pow(1.0 - nDotV, 5.0);
+    // Schlick x^5 via explicit muls — faster than pow(x, 5.0)
+    let hInv = 1.0 - hDotV;  let hInv2 = hInv * hInv;
+    let nInv = 1.0 - nDotV;  let nInv2 = nInv * nInv;
+    let fresnel = f0 + (vec3f(1.0) - f0) * (hInv2 * hInv2 * hInv);
+    let viewFresnel = f0 + (vec3f(1.0) - f0) * (nInv2 * nInv2 * nInv);
 
     let specPower = mix(256.0, 8.0, roughness);
     let spec = fresnel * pow(nDotH, specPower);
@@ -701,7 +714,7 @@ fn traceSceneReflection(ro: vec3f, rd: vec3f) -> vec3f {
             let ao = mat.metalRoughAoAlphaMode.z;
             let emissive = mat.emissiveCutoff.xyz;
             let hitReflDir = normalize(mix(reflect(-v, n), n, roughness * roughness));
-            let hitEnv = sampleSky(hitReflDir);
+            let hitEnv = sampleSkyNorm(hitReflDir);
             let hitColor = shadePbrCore(baseColor, metallic, roughness, ao, emissive,
                                         n, v, l, shadowFactor, hitEnv, 1.0);
 
@@ -722,13 +735,13 @@ fn traceSceneReflection(ro: vec3f, rd: vec3f) -> vec3f {
         t += max(d, 0.01);
     }
 
-    return accumulated + sampleSky(rd) * remaining;
+    return accumulated + sampleSkyNorm(rd) * remaining;
 }
 
 fn shadePbr(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissive: vec3f,
             n: vec3f, v: vec3f, l: vec3f, shadowFactor: f32, p: vec3f) -> vec3f {
     let reflDir = normalize(mix(reflect(-v, n), n, roughness * roughness));
-    var envColor = sampleSky(reflDir);
+    var envColor = sampleSkyNorm(reflDir);
     if (params.reflectionMode > 0.5 && metallic > 0.001) {
         envColor = traceSceneReflection(p + n * 0.02, reflDir);
     }
@@ -737,14 +750,15 @@ fn shadePbr(baseColor: vec3f, metallic: f32, roughness: f32, ao: f32, emissive: 
                         n, v, l, shadowFactor, envColor, reflStrength);
 }
 
-// Normal calculation
+// Normal calculation — tetrahedral 4-tap method (IQ), saves 2 map() calls vs 6-tap.
 fn normal(p: vec3f) -> vec3f {
-    let e = vec2f(0.0001, 0.0);
-    return normalize(vec3f(
-        map(p + e.xyy) - map(p - e.xyy),
-        map(p + e.yxy) - map(p - e.yxy),
-        map(p + e.yyx) - map(p - e.yyx)
-    ));
+    let k = vec2f(1.0, -1.0) * 0.0001;
+    return normalize(
+        k.xyy * map(p + k.xyy) +
+        k.yyx * map(p + k.yyx) +
+        k.yxy * map(p + k.yxy) +
+        k.xxx * map(p + k.xxx)
+    );
 }
 
 // [SHADOW_SECTION_BEGIN]
@@ -882,31 +896,20 @@ fn calcShadow(p: vec3f, n: vec3f, l: vec3f, skipRoot: i32) -> f32 {
 }
 // [SHADOW_SECTION_END]
 
-// Find the group root index for a given sorted object index
-fn findGroupRoot(objIdx: i32) -> i32 {
-    var idx = objIdx;
-    while (idx > 0) {
-        if (i32(objects[idx].colorAndParent.w) < 0) {
-            return idx;
-        }
-        idx--;
-    }
-    return 0;
-}
-
 // Scene map excluding up to 3 groups (pass -1 to not skip)
 fn mapExcluding(p: vec3f, skip0: i32, skip1: i32, skip2: i32) -> f32 {
     return mapInternal(p, skip0, skip1, skip2, true);
 }
 
-// Normal calculation excluding specific groups
+// Normal calculation excluding specific groups — tetrahedral 4-tap method.
 fn normalExcluding(p: vec3f, skip0: i32, skip1: i32, skip2: i32) -> vec3f {
-    let e = vec2f(0.0001, 0.0);
-    return normalize(vec3f(
-        mapExcluding(p + e.xyy, skip0, skip1, skip2) - mapExcluding(p - e.xyy, skip0, skip1, skip2),
-        mapExcluding(p + e.yxy, skip0, skip1, skip2) - mapExcluding(p - e.yxy, skip0, skip1, skip2),
-        mapExcluding(p + e.yyx, skip0, skip1, skip2) - mapExcluding(p - e.yyx, skip0, skip1, skip2)
-    ));
+    let k = vec2f(1.0, -1.0) * 0.0001;
+    return normalize(
+        k.xyy * mapExcluding(p + k.xyy, skip0, skip1, skip2) +
+        k.yyx * mapExcluding(p + k.yyx, skip0, skip1, skip2) +
+        k.yxy * mapExcluding(p + k.yxy, skip0, skip1, skip2) +
+        k.xxx * mapExcluding(p + k.xxx, skip0, skip1, skip2)
+    );
 }
 
 // Grid rendering function - returns vec4 with alpha for transparency
@@ -988,7 +991,7 @@ fn renderAtUv(uv: vec2f) -> FragmentOutput {
     }
 
     // Background from sky texture.
-    let bgCol = sampleSky(rd);
+    let bgCol = sampleSkyNorm(rd);
     let l = LIGHT_DIR;
 
     // Bounds debug viewport: visualize group conservative sphere bounds.
@@ -1135,7 +1138,7 @@ fn renderAtUv(uv: vec2f) -> FragmentOutput {
 
         // Cutout mode: discard surface and continue ray past this group
         if (alphaMode == 1 && opacity < alphaCutoff) {
-            let root = findGroupRoot(objectId);
+            let root = colorAndId.groupRoot;
             if (numSkipped == 0) { skip0 = root; }
             else if (numSkipped == 1) { skip1 = root; }
             else if (numSkipped == 2) { skip2 = root; }
@@ -1163,7 +1166,7 @@ fn renderAtUv(uv: vec2f) -> FragmentOutput {
             accumulated += litColor * opacity * remaining;
             remaining *= (1.0 - opacity);
             // Add this group to skip list so we can find objects inside/behind it
-            let root = findGroupRoot(objectId);
+            let root = colorAndId.groupRoot;
             if (numSkipped == 0) { skip0 = root; }
             else if (numSkipped == 1) { skip1 = root; }
             else if (numSkipped == 2) { skip2 = root; }
@@ -1260,3 +1263,4 @@ fn fs_main(@builtin(position) fragPos: vec4f, @location(0) uv: vec2f) -> Fragmen
     output.objectId = center.objectId;
     return output;
 }
+
