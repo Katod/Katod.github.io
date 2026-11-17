@@ -73,9 +73,23 @@
         .hero {
             position: relative;
             padding: 90px 0 70px;
+        }
+
+        /* Hero image lives on a negative layer so the global glow/orbs canvas draws over it */
+        .hero::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            right: 0;
+            top: 0;
+            bottom: -180px;
+            z-index: -1;
+            pointer-events: none;
             background:
-                linear-gradient(180deg, rgba(18, 19, 22, 0.55) 0%, rgba(18, 19, 22, 0.92) 75%, var(--bg) 100%),
-                url("images/Floralis_RoseWindow.jpg") center 35% / cover no-repeat;
+                linear-gradient(180deg, rgba(18, 19, 22, 0.5) 0%, rgba(18, 19, 22, 0.8) 70%, rgba(18, 19, 22, 0.9) 100%),
+                url("images/Floralis_RoseWindow.jpg") center calc(35% + var(--py, 0px)) / cover no-repeat;
+            -webkit-mask-image: linear-gradient(180deg, #000 0%, #000 55%, transparent 100%);
+            mask-image: linear-gradient(180deg, #000 0%, #000 55%, transparent 100%);
         }
 
         .hero h1 {
@@ -299,18 +313,7 @@
         }
 
         /* ---------- Visual effects ---------- */
-        .hero { overflow: hidden; background-attachment: scroll; }
-
         .hero .wrap { position: relative; z-index: 2; }
-
-        #fireflies {
-            position: absolute;
-            inset: 0;
-            width: 100%;
-            height: 100%;
-            z-index: 1;
-            pointer-events: none;
-        }
 
         .hero h1 {
             background: linear-gradient(90deg, #ffffff 0%, #9fe6ff 40%, #00bfff 60%, #ffffff 100%);
@@ -498,7 +501,7 @@
 
         body.has-cursor #cursor-glow { opacity: 1; }
 
-        .hero, main, footer { position: relative; z-index: 1; }
+        main, footer { position: relative; z-index: 1; }
 
         @media (prefers-reduced-motion: reduce) {
 
@@ -533,7 +536,6 @@
     </nav>
 
     <header class="hero">
-        <canvas id="fireflies"></canvas>
         <a class="scroll-hint" href="#games" aria-label="Scroll down"></a>
         <div class="wrap">
             <h1>Ivan Bozhenko</h1>
@@ -775,85 +777,12 @@
         const onScroll = () => {
             updateNav();
             if (!reduceMotion && window.scrollY < hero.offsetHeight) {
-                hero.style.backgroundPosition = `center, center calc(35% + ${window.scrollY * 0.35}px)`;
+                hero.style.setProperty('--py', (window.scrollY * 0.35) + 'px');
             }
         };
         window.addEventListener('scroll', onScroll, { passive: true });
         onScroll();
 
-        /* ---------- Fireflies ---------- */
-        (() => {
-            const SPEED = reduceMotion ? 0.3 : 1;
-            const canvas = document.getElementById('fireflies');
-            const ctx = canvas.getContext('2d');
-            let w, h, dpr, flies = [];
-            const mouse = { x: -9999, y: -9999 };
-            const colors = ['255,214,140', '160,230,255', '200,170,255'];
-
-            const resize = () => {
-                dpr = Math.min(window.devicePixelRatio || 1, 2);
-                w = canvas.clientWidth; h = canvas.clientHeight;
-                canvas.width = w * dpr; canvas.height = h * dpr;
-                ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-                const count = Math.round(Math.min(90, (w * h) / 14000));
-                flies = Array.from({ length: count }, () => ({
-                    x: Math.random() * w,
-                    y: Math.random() * h,
-                    r: 0.8 + Math.random() * 2.2,
-                    vx: (Math.random() - 0.5) * 0.25,
-                    vy: -0.1 - Math.random() * 0.3,
-                    phase: Math.random() * Math.PI * 2,
-                    speed: 0.01 + Math.random() * 0.025,
-                    c: colors[Math.floor(Math.random() * colors.length)]
-                }));
-            };
-
-            hero.addEventListener('pointermove', e => {
-                const r = canvas.getBoundingClientRect();
-                mouse.x = e.clientX - r.left; mouse.y = e.clientY - r.top;
-            });
-            hero.addEventListener('pointerleave', () => { mouse.x = mouse.y = -9999; });
-
-            let running = false, looping = false;
-            new IntersectionObserver(([en]) => {
-                running = en.isIntersecting;
-                if (running && !looping) { looping = true; requestAnimationFrame(tick); }
-            }).observe(hero);
-
-            function tick() {
-                if (!running) { looping = false; return; }
-                ctx.clearRect(0, 0, w, h);
-                ctx.globalCompositeOperation = 'lighter';
-                for (const f of flies) {
-                    f.phase += f.speed;
-                    const dx = f.x - mouse.x, dy = f.y - mouse.y;
-                    const d2 = dx * dx + dy * dy;
-                    if (d2 < 14000) {
-                        const d = Math.sqrt(d2) || 1;
-                        f.vx += (dx / d) * 0.06; f.vy += (dy / d) * 0.06;
-                    }
-                    f.vx *= 0.985; f.vy = f.vy * 0.985 - 0.003;
-                    f.x += (f.vx + Math.sin(f.phase) * 0.3) * SPEED;
-                    f.y += f.vy * SPEED;
-                    if (f.y < -10) { f.y = h + 10; f.x = Math.random() * w; }
-                    if (f.x < -10) f.x = w + 10; else if (f.x > w + 10) f.x = -10;
-
-                    const a = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(f.phase * 1.7));
-                    const g = ctx.createRadialGradient(f.x, f.y, 0, f.x, f.y, f.r * 6);
-                    g.addColorStop(0, `rgba(${f.c},${a})`);
-                    g.addColorStop(1, `rgba(${f.c},0)`);
-                    ctx.fillStyle = g;
-                    ctx.beginPath();
-                    ctx.arc(f.x, f.y, f.r * 6, 0, Math.PI * 2);
-                    ctx.fill();
-                }
-                ctx.globalCompositeOperation = 'source-over';
-                requestAnimationFrame(tick);
-            }
-
-            window.addEventListener('resize', resize);
-            resize();
-        })();
 
         /* ---------- Global background: glowing fireflies + cursor glow ---------- */
         (() => {
